@@ -1,0 +1,723 @@
+/*
+ * ============================================================================
+ * Alarme independente — ESP8266 + DS3231 + LCD 1602 I2C — v6
+ * ============================================================================
+ * Reescrito a partir do plano de consolidação. Mudanças estruturais:
+ *
+ * 1. DISPARO POR BORDA DE MINUTO. A varredura dos alarmes acontece UMA vez a
+ *    cada virada de minuto, não continuamente. Some o lastTriggeredMin global
+ *    que podia ser sujado por um alarme e bloquear outro.
+ * 2. HORÁRIO COMO MINUTO DO DIA (0..1439). Uma comparação de inteiro só.
+ * 3. MEMÓRIA EM BLOCO ÚNICO com magia + versão + CRC. Incrementar VERSAO
+ *    invalida qualquer resíduo de layout antigo em vez de reinterpretá-lo.
+ * 4. 3 alarmes (era 5). Sem detecção de conflito de horário: horários
+ *    repetidos são permitidos e o alarme de menor índice vence.
+ * 5. ALARME E TESTE encerram com UM clique de qualquer botão, ou sozinhos
+ *    após 1 minuto. Blindagem de 2s implementada contra ruídos.
+ * 6. Buzzer fixo: 25 bips de 10ms ON/10ms OFF (500ms) + 1s de silêncio.
+ * 7. LCD redesenhado por diferença de célula, não linha inteira 5x/s.
+ * 8. Backlight configurado para permanecer SEMPRE LIGADO.
+ * 9. BUG DE UNDERFLOW TEMPORAL RESOLVIDO (sincronização da variável 'agora').
+ *
+ * Bibliotecas: LiquidCrystal_I2C (fdebrabander), RTClib (Adafruit),
+ *              IRremoteESP8266.
+ * ============================================================================
+ */
+
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <RTClib.h>
+#include <EEPROM.h>
+#include <IRremoteESP8266.h>
+#include <IRsend.h>
+
+// ================= PINOS =================
+#define PIN_SDA     4
+#define PIN_SCL     5
+#define PIN_BUZZER 12
+#define PIN_IR     13
+#define PIN_SW1    14   // navega / long press trava a página
+#define PIN_SW2    16   // incrementa / confirma  (pull-up EXTERNO R7 10k)
+#define PIN_LED     2   // LED da placa, ativo em LOW
+
+// ================= OBJETOS =================
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+RTC_DS3231 rtc;
+IRsend irsend(PIN_IR);
+
+// ================= MODELO DE DADOS =================
+#define MAGIA       0x5A
+#define VERSAO      1      // incremente ao mudar o layout: invalida o antigo
+#define EEPROM_TAM  16
+#define N_ALARMES   3
+
+struct __attribute__((packed)) Alarme {
+  uint16_t minuto;   // 0..1439 — minuto do dia
+  uint8_t  ir;       // 0=nada 1=ON 2=OFF 3=RED 4=GRN 5=BLU 6=WHT
+  uint8_t  buz;      // 0=mudo 1=bip padrão
+};
+
+struct __attribute__((packed)) Config {
+  uint8_t magia;
+  uint8_t versao;
+  Alarme  alarmes[N_ALARMES];
+  uint8_t crc;
+};
+
+Config cfg;
+bool sujo[N_ALARMES] = {false, false, false};   // só em RAM, nunca gravado
+
+Alarme teste = {0, 3, 1};                        // página N: RED + som
+
+#define IR_NADA 0
+#define IR_OFF  2
+const char irNome[7][4] = {"---", "ON ", "OFF", "RED", "GRN", "BLU", "WHT"};
+
+// ================= ESTADO =================
+enum Estado { MENU, TOCANDO, TESTANDO };
+Estado estado = MENU;
+
+uint8_t pagina = 0;      // 0=C, 1..3=alarmes, 4=N
+uint8_t campo  = 0;
+bool    travada = false;
+
+uint8_t alarmeAtivo = 0;
+uint32_t inicioDisparo = 0;
+#define DURACAO_MAX 60000UL   // 1 minuto para alarme e para teste
+
+// Relógio
+DateTime agoraRtc;
+bool rtcOk = false;
+uint32_t marcaLeituraRtc = 0;
+uint32_t rtcFalhaDesde = 0;
+#define RECUPERA_I2C 30000UL
+
+// Borda de minuto
+uint16_t ultimoMinutoVisto = 0;
+bool minutoIniciado = false;
+
+// Ajuste de relógio (página C)
+uint8_t ajusteH = 0, ajusteM = 0;
+
+// Buzzer fixo
+uint8_t buzzFase = 0;          // 0..49 — 25 bips de duas meias-fases
+bool    buzzNoBurst = true;
+uint32_t buzzMarca = 0;
+#define BIP_MS      10
+#define BIP_FASES   50
+#define PAUSA_MS    1000
+
+// IR
+uint32_t irMarca = 0;
+bool irMandaOnAntes = false;
+uint8_t offEnviados = 0;
+uint32_t offMarca = 0;
+
+// Botões
+bool brutoSw1 = HIGH, estavelSw1 = HIGH;
+bool brutoSw2 = HIGH, estavelSw2 = HIGH;
+uint32_t mudaSw1 = 0, mudaSw2 = 0;
+uint32_t pressaoSw1 = 0;
+bool longTratado = false;
+#define DEBOUNCE   30
+#define LONGPRESS  800
+
+// Display
+#define CH_SETA  1
+#define CH_CHECK 2
+byte glifoSeta[8]  = {0x00, 0x04, 0x0E, 0x1F, 0x04, 0x04, 0x00, 0x00};
+byte glifoCheck[8] = {0x00, 0x01, 0x03, 0x16, 0x1C, 0x08, 0x00, 0x00};
+char cache0[16], cache1[16];
+uint32_t marcaDesenho = 0;
+
+// ================= PROTÓTIPOS =================
+void carregaConfig();
+void gravaConfig();
+void formataConfig();
+uint8_t calculaCrc(const Config &c);
+void leRtc(uint32_t agora);
+void verificaBordaMinuto(uint32_t agora);
+void disparaAlarme(uint8_t i, uint32_t agora);
+void encerraDisparo();
+void servicoDisparo(uint32_t agora);
+void atualizaBuzzer(uint32_t agora, bool ativo);
+void enviaIR(uint8_t modo);
+void repeteIR(uint32_t agora, uint8_t modo);
+void trataBotoes(uint32_t agora);
+void desenha(uint32_t agora);
+void servicoLed(uint32_t agora);
+void ajustaRelogio(uint8_t h, uint8_t m);
+int16_t proximoAlarme();
+uint8_t nCampos(uint8_t pg);
+uint8_t colunaCursor(uint8_t pg, uint8_t cp);
+
+// ============================================================================
+// SETUP
+// ============================================================================
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\n=== ALARME v6-debug: boot ===");
+
+  pinMode(PIN_BUZZER, OUTPUT);
+  pinMode(PIN_LED, OUTPUT);
+  pinMode(PIN_SW1, INPUT_PULLUP);
+  pinMode(PIN_SW2, INPUT);          // pull-up externo (R7) — IO16 não tem interno
+
+  digitalWrite(PIN_BUZZER, LOW);
+  digitalWrite(PIN_LED, HIGH);      // apagado
+
+  Wire.begin(PIN_SDA, PIN_SCL);
+  Wire.setClockStretchLimit(2000);
+  delay(250);                       // único delay do firmware, antes do loop
+
+  rtc.begin();
+  lcd.init();
+  lcd.backlight();                  // O backlight agora é ligado e não será mais desligado
+  lcd.createChar(CH_SETA, glifoSeta);
+  lcd.createChar(CH_CHECK, glifoCheck);
+  irsend.begin();
+
+  memset(cache0, 0xFF, 16);         // força o primeiro desenho completo
+  memset(cache1, 0xFF, 16);
+
+  carregaConfig();
+
+  Serial.printf("[BOOT] sizeof(Config)=%d\n", (int)sizeof(Config));
+  for (uint8_t i = 0; i < N_ALARMES; i++) {
+    Serial.printf("[BOOT] alarme %d: minuto=%d (h=%d m=%d) ir=%d buz=%d sujo=%d\n",
+                  i, cfg.alarmes[i].minuto, cfg.alarmes[i].minuto/60,
+                  cfg.alarmes[i].minuto%60, cfg.alarmes[i].ir, cfg.alarmes[i].buz, sujo[i]);
+  }
+}
+
+// ============================================================================
+// LOOP
+// ============================================================================
+void loop() {
+  uint32_t agora = millis();
+
+  leRtc(agora);
+  verificaBordaMinuto(agora);
+  trataBotoes(agora);
+  servicoDisparo(agora);
+  desenha(agora);
+  servicoLed(agora);
+
+  yield();
+}
+
+// ============================================================================
+// MEMÓRIA
+// ============================================================================
+uint8_t calculaCrc(const Config &c) {
+  const uint8_t *p = (const uint8_t *)&c;
+  uint8_t x = 0;
+  for (uint8_t i = 0; i < sizeof(Config) - 1; i++) x ^= p[i];
+  return x;
+}
+
+void carregaConfig() {
+  EEPROM.begin(EEPROM_TAM);
+  EEPROM.get(0, cfg);
+
+  bool ok = (cfg.magia == MAGIA) && (cfg.versao == VERSAO) &&
+            (cfg.crc == calculaCrc(cfg));
+
+  Serial.printf("[LOAD] lido: magia=%02X (esperado %02X) versao=%d (esperado %d) crc=%02X (calc=%02X) ok=%d\n",
+                cfg.magia, MAGIA, cfg.versao, VERSAO, cfg.crc, calculaCrc(cfg), ok);
+
+  // Faixa fora do esperado conta como bloco corrompido, não campo isolado.
+  if (ok) {
+    for (uint8_t i = 0; i < N_ALARMES; i++) {
+      if (cfg.alarmes[i].minuto > 1439) ok = false;
+      if (cfg.alarmes[i].ir > 6)        ok = false;
+      if (cfg.alarmes[i].buz > 1)       ok = false;
+    }
+  }
+
+  if (!ok) {
+    Serial.println("[LOAD] bloco invalido -> FORMATANDO (alarmes voltam a zero)");
+    formataConfig();
+  }
+
+  for (uint8_t i = 0; i < N_ALARMES; i++) sujo[i] = false;
+}
+
+void formataConfig() {
+  memset(&cfg, 0, sizeof(Config));
+  cfg.magia = MAGIA;
+  cfg.versao = VERSAO;
+  gravaConfig();
+}
+
+// Grava o bloco inteiro de uma vez. Gravar em qualquer página confirma todos
+// os alarmes pendentes — por isso todos os '*' voltam a '✓' juntos.
+void gravaConfig() {
+  cfg.magia = MAGIA;
+  cfg.versao = VERSAO;
+  cfg.crc = calculaCrc(cfg);
+  EEPROM.put(0, cfg);
+  EEPROM.commit();
+  for (uint8_t i = 0; i < N_ALARMES; i++) sujo[i] = false;
+
+  Serial.println("[SAVE] gravado:");
+  for (uint8_t i = 0; i < N_ALARMES; i++) {
+    Serial.printf("[SAVE]   alarme %d: minuto=%d (h=%d m=%d) ir=%d buz=%d\n",
+                  i, cfg.alarmes[i].minuto, cfg.alarmes[i].minuto/60,
+                  cfg.alarmes[i].minuto%60, cfg.alarmes[i].ir, cfg.alarmes[i].buz);
+  }
+
+  // Confirma lendo de volta da EEPROM (não da RAM), para pegar qualquer
+  // falha de escrita silenciosa.
+  Config relido;
+  EEPROM.get(0, relido);
+  Serial.printf("[SAVE] releitura: magia=%02X versao=%d crc=%02X (calculado=%02X)\n",
+                relido.magia, relido.versao, relido.crc, calculaCrc(relido));
+}
+
+// ============================================================================
+// RELÓGIO
+// ============================================================================
+void leRtc(uint32_t agora) {
+  if ((uint32_t)(agora - marcaLeituraRtc) < 1000) return;
+  marcaLeituraRtc = agora;
+
+  Wire.beginTransmission(0x68);
+  bool respondeu = (Wire.endTransmission() == 0);
+
+  if (respondeu) {
+    DateTime t = rtc.now();
+    if (t.year() >= 2020 && t.year() <= 2099) {
+      agoraRtc = t;
+      if (!rtcOk) Serial.println("[RTC] recuperou validade");
+      rtcOk = true;
+      rtcFalhaDesde = 0;
+      return;
+    }
+    Serial.printf("[RTC] leitura insana: ano=%d mes=%d dia=%d\n", t.year(), t.month(), t.day());
+  } else {
+    Serial.println("[RTC] ping I2C falhou (endTransmission != 0)");
+  }
+
+  rtcOk = false;
+  if (rtcFalhaDesde == 0) rtcFalhaDesde = agora;
+
+  // Barramento travado por muito tempo: reinicia o periférico I2C.
+  if ((uint32_t)(agora - rtcFalhaDesde) >= RECUPERA_I2C) {
+    Wire.begin(PIN_SDA, PIN_SCL);
+    Wire.setClockStretchLimit(2000);
+    rtcFalhaDesde = agora;
+  }
+}
+
+void ajustaRelogio(uint8_t h, uint8_t m) {
+  // Preserva a data: só troca hora e minuto.
+  DateTime base = rtcOk ? agoraRtc : DateTime(2026, 1, 1, 0, 0, 0);
+  rtc.adjust(DateTime(base.year(), base.month(), base.day(), h, m, 0));
+}
+
+// ============================================================================
+// DISPARO POR BORDA DE MINUTO
+// ============================================================================
+void verificaBordaMinuto(uint32_t agora) {
+  if (!rtcOk) return;
+
+  uint16_t minutoAgora = agoraRtc.hour() * 60 + agoraRtc.minute();
+
+  // Primeira leitura válida: só ancora o minuto, sem varrer. Sem isso, ligar
+  // o aparelho exatamente no horário de um alarme dispararia na hora.
+  if (!minutoIniciado) {
+    ultimoMinutoVisto = minutoAgora;
+    minutoIniciado = true;
+    Serial.printf("[MIN] ancorado em %d (h=%d m=%d)\n",
+                  minutoAgora, agoraRtc.hour(), agoraRtc.minute());
+    return;
+  }
+
+  if (minutoAgora == ultimoMinutoVisto) return;
+  Serial.printf("[MIN] virou: %d -> %d (h=%d m=%d s=%d)\n",
+                ultimoMinutoVisto, minutoAgora,
+                agoraRtc.hour(), agoraRtc.minute(), agoraRtc.second());
+  ultimoMinutoVisto = minutoAgora;
+
+  if (estado == TOCANDO) {
+    Serial.println("[MIN] ja tocando, ignorando esta virada");
+    return;
+  }
+
+  bool algumBateu = false;
+  for (uint8_t i = 0; i < N_ALARMES; i++) {
+    Serial.printf("[MIN]   alarme %d: minuto=%d sujo=%d ir=%d buz=%d -> ",
+                  i, cfg.alarmes[i].minuto, sujo[i], cfg.alarmes[i].ir, cfg.alarmes[i].buz);
+    if (sujo[i]) { Serial.println("pulado (sujo)"); continue; }
+    if (cfg.alarmes[i].ir == IR_NADA && cfg.alarmes[i].buz == 0) { Serial.println("pulado (sem acao)"); continue; }
+    if (cfg.alarmes[i].minuto != minutoAgora) { Serial.println("pulado (minuto diferente)"); continue; }
+    Serial.println("*** BATEU, DISPARANDO ***");
+    algumBateu = true;
+    disparaAlarme(i, agora);
+    break;
+  }
+  if (!algumBateu) Serial.println("[MIN] nenhum alarme bateu este minuto");
+}
+
+void disparaAlarme(uint8_t i, uint32_t agora) {
+  Serial.println("[DISPARO] entrou em disparaAlarme");
+  estado = TOCANDO;
+  alarmeAtivo = i;
+  inicioDisparo = agora; // O underflow acontecia porque isso aqui era millis() independente.
+
+  buzzFase = 0;
+  buzzNoBurst = true;
+  buzzMarca = agora;
+
+  irMarca = 0;
+  irMandaOnAntes = (cfg.alarmes[i].ir >= 3);  // cor precisa da lâmpada ligada
+  offEnviados = 0;
+  offMarca = 0;
+
+  Serial.println("[DISPARO] disparo concluido");
+}
+
+void encerraDisparo() {
+  Serial.printf("[DISPARO] encerrado em millis=%u (durou %ums)\n", millis(), millis()-inicioDisparo);
+  estado = MENU;
+  digitalWrite(PIN_BUZZER, LOW);
+  buzzFase = 0;
+  buzzNoBurst = true;
+}
+
+void servicoDisparo(uint32_t agora) {
+  if (estado == MENU) return;
+
+  // Timeout de 1 minuto, igual para alarme e para teste.
+  if ((uint32_t)(agora - inicioDisparo) >= DURACAO_MAX) {
+    encerraDisparo();
+    return;
+  }
+
+  uint8_t ir  = (estado == TOCANDO) ? cfg.alarmes[alarmeAtivo].ir  : teste.ir;
+  uint8_t buz = (estado == TOCANDO) ? cfg.alarmes[alarmeAtivo].buz : teste.buz;
+
+  // Apagar a luz não é um alarme que precisa ser atendido: manda o comando
+  // duas vezes (reforço contra perda de sinal) e encerra, sem som.
+  if (ir == IR_OFF) {
+    digitalWrite(PIN_BUZZER, LOW);
+    if (offEnviados < 2) {
+      if (offEnviados == 0 || (uint32_t)(agora - offMarca) >= 300) {
+        enviaIR(IR_OFF);
+        offMarca = agora;
+        offEnviados++;
+      }
+    } else {
+      encerraDisparo();
+    }
+    return;
+  }
+
+  atualizaBuzzer(agora, buz == 1);
+  if (ir != IR_NADA) repeteIR(agora, ir);
+}
+
+// ============================================================================
+// PERIFÉRICOS
+// ============================================================================
+// Burst de 25 bips (10ms ligado + 10ms desligado) = 500ms, depois 1s de
+// silêncio, repetindo enquanto durar o disparo.
+void atualizaBuzzer(uint32_t agora, bool ativo) {
+  static uint32_t ultimoLog = 0;
+  static uint32_t contagemHigh = 0;
+  if (estado != MENU) {
+    if (ativo && buzzNoBurst && (buzzFase % 2 == 0)) contagemHigh++;
+    if (agora - ultimoLog >= 2000) {
+      ultimoLog = agora;
+      Serial.printf("[BUZZER] agora=%u ativo=%d buzzNoBurst=%d buzzFase=%d contagemHIGH_total=%u pino=%d\n",
+                    agora, ativo, buzzNoBurst, buzzFase, contagemHigh, PIN_BUZZER);
+    }
+  } else {
+    contagemHigh = 0;
+  }
+
+  if (!ativo) {
+    digitalWrite(PIN_BUZZER, LOW);
+    return;
+  }
+
+  if (buzzNoBurst) {
+    digitalWrite(PIN_BUZZER, (buzzFase % 2 == 0) ? HIGH : LOW);
+    if ((uint32_t)(agora - buzzMarca) >= BIP_MS) {
+      buzzMarca = agora;
+      buzzFase++;
+      if (buzzFase >= BIP_FASES) {
+        buzzFase = 0;
+        buzzNoBurst = false;
+      }
+    }
+  } else {
+    digitalWrite(PIN_BUZZER, LOW);
+    if ((uint32_t)(agora - buzzMarca) >= PAUSA_MS) {
+      buzzMarca = agora;
+      buzzNoBurst = true;
+    }
+  }
+}
+
+void enviaIR(uint8_t modo) {
+  uint32_t codigo = 0;
+  switch (modo) {
+        case 1: codigo = 0xF7C03F; break; // ON
+        case 2: codigo = 0xF740BF; break; // OFF
+        case 3: codigo = 0xF720DF; break; // RED
+        case 4: codigo = 0xF7A05F; break; // GRN
+        case 5: codigo = 0xF7609F; break; // BLU
+        case 6: codigo = 0xF728D7; break; // STR
+  }
+  if (codigo != 0) irsend.sendNEC(codigo, 32);
+}
+
+void repeteIR(uint32_t agora, uint8_t modo) {
+  if (irMarca != 0 && (uint32_t)(agora - irMarca) < 1500) return;
+  irMarca = agora;
+
+  if (irMandaOnAntes) {
+    irMandaOnAntes = false;
+    enviaIR(1);          // liga a lâmpada antes de mandar a cor
+    return;
+  }
+  enviaIR(modo);
+}
+
+// ============================================================================
+// BOTÕES
+// ============================================================================
+uint8_t nCampos(uint8_t pg) {
+  if (pg == 0) return 5;             // página, HH, MM, gravar(S), zerar(Z)
+  if (pg <= 3) return 6;             // página, HH, MM, cor, som, gravar
+  return 4;                          // página, disparar, cor, som
+}
+
+uint8_t colunaCursor(uint8_t pg, uint8_t cp) {
+  static const uint8_t colC[5] = {0, 8, 11, 14, 15};
+  static const uint8_t colA[6] = {0, 2, 5, 8, 12, 15};
+  static const uint8_t colN[4] = {0, 2, 8, 12};
+  if (pg == 0) return colC[cp];
+  if (pg <= 3) return colA[cp];
+  return colN[cp];
+}
+
+void trataBotoes(uint32_t agora) {
+  bool leituraSw1 = digitalRead(PIN_SW1);
+  bool leituraSw2 = digitalRead(PIN_SW2);
+
+  if (leituraSw1 != brutoSw1) { mudaSw1 = agora; brutoSw1 = leituraSw1; }
+  if (leituraSw2 != brutoSw2) { mudaSw2 = agora; brutoSw2 = leituraSw2; }
+
+  bool desceSw1 = false, subiSw1 = false, desceSw2 = false;
+
+  if ((uint32_t)(agora - mudaSw1) >= DEBOUNCE && leituraSw1 != estavelSw1) {
+    estavelSw1 = leituraSw1;
+    if (estavelSw1 == LOW) desceSw1 = true; else subiSw1 = true;
+  }
+  if ((uint32_t)(agora - mudaSw2) >= DEBOUNCE && leituraSw2 != estavelSw2) {
+    estavelSw2 = leituraSw2;
+    if (estavelSw2 == LOW) desceSw2 = true;
+  }
+
+  // Alarme ou teste tocando: QUALQUER botão encerra, e nada mais acontece.
+  // O clique é consumido pelo cancelamento, não navega nem edita.
+  if (estado != MENU) {
+    // Blindagem de software: Ignora ruídos (ou cliques intencionais rápidos demais)
+    // nos primeiros 2 segundos após disparar para impedir um falso encerramento do alarme.
+    if ((uint32_t)(agora - inicioDisparo) >= 2000) {
+      if (desceSw1 || desceSw2) encerraDisparo();
+    }
+    return;
+  }
+
+  // ---- SW1: navega entre campos; long press trava a página ----
+  if (desceSw1) {
+    pressaoSw1 = agora;
+    longTratado = false;
+  }
+  if (estavelSw1 == LOW && !longTratado &&
+      (uint32_t)(agora - pressaoSw1) > LONGPRESS) {
+    longTratado = true;
+    if (campo == 0) travada = !travada;
+  }
+  if (subiSw1 && !longTratado) {
+    campo = (campo + 1) % nCampos(pagina);
+  }
+
+  // ---- SW2: incrementa o campo / confirma ----
+  if (!desceSw2) return;
+
+  if (campo == 0) {
+    if (!travada) {
+      pagina = (pagina + 1) % 5;
+      campo = 0;
+      if (pagina == 0) { ajusteH = 0; ajusteM = 0; }
+    }
+    return;
+  }
+
+  if (pagina == 0) {
+    if (campo == 1) ajusteH = (ajusteH + 1) % 24;
+    if (campo == 2) ajusteM = (ajusteM + 1) % 60;
+    if (campo == 3) ajustaRelogio(ajusteH, ajusteM);
+    if (campo == 4) ajustaRelogio(0, 0);
+    return;
+  }
+
+  if (pagina <= 3) {
+    uint8_t i = pagina - 1;
+    uint8_t h = cfg.alarmes[i].minuto / 60;
+    uint8_t m = cfg.alarmes[i].minuto % 60;
+    switch (campo) {
+      case 1: cfg.alarmes[i].minuto = ((h + 1) % 24) * 60 + m; sujo[i] = true; break;
+      case 2: cfg.alarmes[i].minuto = h * 60 + (m + 1) % 60;   sujo[i] = true; break;
+      case 3: cfg.alarmes[i].ir = (cfg.alarmes[i].ir + 1) % 7; sujo[i] = true; break;
+      case 4: cfg.alarmes[i].buz = cfg.alarmes[i].buz ? 0 : 1; sujo[i] = true; break;
+      case 5: gravaConfig(); break;
+    }
+    return;
+  }
+
+  // Página N (teste)
+  if (campo == 1) {
+    estado = TESTANDO;
+    inicioDisparo = agora; // O teste já usava a variável congelada perfeitamente.
+    buzzFase = 0;
+    buzzNoBurst = true;
+    buzzMarca = agora;
+    irMarca = 0;
+    irMandaOnAntes = (teste.ir >= 3);
+    offEnviados = 0;
+    offMarca = 0;
+  }
+  if (campo == 2) teste.ir = (teste.ir + 1) % 7;
+  if (campo == 3) teste.buz = teste.buz ? 0 : 1;
+}
+
+// ============================================================================
+// LED DA PLACA
+// ============================================================================
+// Prioridade: falha de RTC (pisca) > teste em curso (aceso) > normal (apagado).
+void servicoLed(uint32_t agora) {
+  if (!rtcOk) {
+    digitalWrite(PIN_LED, ((agora / 500) % 2 == 0) ? LOW : HIGH);
+    return;
+  }
+  digitalWrite(PIN_LED, (estado == TESTANDO) ? LOW : HIGH);
+}
+
+
+// ============================================================================
+// DISPLAY
+// ============================================================================
+static void doisDig(char *b, uint8_t v) {
+  b[0] = '0' + (v / 10);
+  b[1] = '0' + (v % 10);
+}
+
+// Minuto do dia do próximo alarme armado, ou -1 se nenhum está armado.
+// É o diagnóstico permanente: se um alarme não vai tocar, isso aparece aqui
+// horas antes, em vez de no momento em que era para tocar.
+int16_t proximoAlarme() {
+  if (!rtcOk) return -1;
+  uint16_t agoraMin = agoraRtc.hour() * 60 + agoraRtc.minute();
+  int16_t melhor = -1;
+  uint16_t menorDelta = 0xFFFF;
+
+  for (uint8_t i = 0; i < N_ALARMES; i++) {
+    if (sujo[i]) continue;
+    if (cfg.alarmes[i].ir == IR_NADA && cfg.alarmes[i].buz == 0) continue;
+    uint16_t m = cfg.alarmes[i].minuto;
+    uint16_t d = (m >= agoraMin) ? (m - agoraMin) : (1440 - agoraMin + m);
+    if (d < menorDelta) { menorDelta = d; melhor = (int16_t)m; }
+  }
+  return melhor;
+}
+
+static void montaLinha0(char *b) {
+  memset(b, ' ', 16);
+
+  if (pagina == 0) {
+    b[0] = 'C';
+    if (rtcOk) { doisDig(b + 2, agoraRtc.hour()); doisDig(b + 5, agoraRtc.minute()); }
+    else       { b[2] = b[3] = b[5] = b[6] = '-'; }
+    b[4] = ':';
+    doisDig(b + 8, ajusteH); b[10] = ':'; doisDig(b + 11, ajusteM);
+    b[14] = 'S';
+    b[15] = 'Z';
+  } else if (pagina <= 3) {
+    uint8_t i = pagina - 1;
+    b[0] = '0' + pagina;
+    doisDig(b + 2, cfg.alarmes[i].minuto / 60);
+    b[4] = ':';
+    doisDig(b + 5, cfg.alarmes[i].minuto % 60);
+    memcpy(b + 8, irNome[cfg.alarmes[i].ir], 3);
+    b[12] = cfg.alarmes[i].buz ? 'S' : '-';
+    b[15] = sujo[i] ? '*' : (char)CH_CHECK;
+  } else {
+    b[0] = 'N';
+    b[2] = '>';
+    memcpy(b + 8, irNome[teste.ir], 3);
+    b[12] = teste.buz ? 'S' : '-';
+  }
+}
+
+static void montaLinha1(char *b, uint32_t agora) {
+  memset(b, ' ', 16);
+
+  if (estado == TOCANDO) {
+    memcpy(b, "ALARME ", 7);
+    b[7] = '1' + alarmeAtivo;
+    return;
+  }
+  if (estado == TESTANDO) {
+    memcpy(b, "TESTE", 5);
+    return;
+  }
+
+  // Texto de situação só no campo de repouso, para não colidir com o cursor.
+  if (campo == 0) {
+    if (!rtcOk) {
+      memcpy(b + 5, "SEM RTC", 7);
+    } else if (pagina == 0) {
+      int16_t p = proximoAlarme();
+      memcpy(b + 5, "prox ", 5);
+      if (p < 0) { memcpy(b + 10, "--:--", 5); }
+      else { doisDig(b + 10, p / 60); b[12] = ':'; doisDig(b + 13, p % 60); }
+    }
+  }
+
+  // Cursor piscando. Com a página travada ele fica fixo, sinalizando a trava.
+  bool mostra = travada ? true : ((agora % 700) < 420);
+  if (mostra) b[colunaCursor(pagina, campo)] = (char)CH_SETA;
+}
+
+// Escreve só as células que mudaram desde o último desenho. Isso corta o
+// tráfego no barramento I2C, que é compartilhado com o RTC.
+static void escreveLinha(uint8_t linha, const char *novo, char *cacheLinha) {
+  uint8_t i = 0;
+  while (i < 16) {
+    if (novo[i] == cacheLinha[i]) { i++; continue; }
+    lcd.setCursor(i, linha);
+    while (i < 16 && novo[i] != cacheLinha[i]) {
+      lcd.write((uint8_t)novo[i]);
+      cacheLinha[i] = novo[i];
+      i++;
+    }
+  }
+}
+
+void desenha(uint32_t agora) {
+  if ((uint32_t)(agora - marcaDesenho) < 120) return;
+  marcaDesenho = agora;
+
+  char l0[16], l1[16];
+  montaLinha0(l0);
+  montaLinha1(l1, agora);
+
+  escreveLinha(0, l0, cache0);
+  escreveLinha(1, l1, cache1);
+}
