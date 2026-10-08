@@ -16,3 +16,5 @@ BC547 Transistor;
 2 Buttons;
 
 Resistors;
+
+![Schematic](https://raw.githubusercontent.com/petrhonez/ESP8266-Alarm/refs/heads/main/schematic.png)
